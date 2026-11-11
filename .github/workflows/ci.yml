@@ -1,0 +1,86 @@
+name: CI
+
+on:
+  push:
+    branches: [main, "feature/**"]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    name: test (${{ matrix.os }} · py${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Explicit combos: every OS on 3.13, plus the 3.9 floor. macos-latest is
+        # arm64, which has no 3.9 in the runner manifest; the x64 macos-13 runners
+        # that used to cover it have been retired, so that job now sits queued
+        # forever and the whole run never completes. The macOS floor is therefore
+        # 3.10 (the oldest arm64 build available) — the 3.9 floor itself stays
+        # covered on Ubuntu and Windows, and macOS shares the POSIX code path
+        # with Ubuntu. Never add macos-13 back. ubuntu-latest became 26.04 in
+        # Oct 2026, which has no 3.9 build either, so the Linux floor job is
+        # pinned to 24.04.
+        include:
+          - { os: ubuntu-24.04, python-version: "3.9" }
+          - { os: ubuntu-latest, python-version: "3.13" }
+          - { os: macos-latest, python-version: "3.10" }
+          - { os: macos-latest, python-version: "3.13" }
+          - { os: windows-latest, python-version: "3.9" }
+          - { os: windows-latest, python-version: "3.13" }
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      # The test extra brings jsonschema for the protocol conformance suite
+      # (tests/conformance), which runs as part of `pytest` once the daemon is
+      # on the branch and skips with its reason until then.
+      - name: Install package with test extras
+        run: python -m pip install --upgrade pip && pip install -e ".[test]"
+
+      - name: Import smoke test (all platforms)
+        run: python -c "import tunetape.__main__, tunetape.ui, tunetape.player, tunetape.demo; from tunetape import terminal, ipc, sources, engine, daemon, client, cli; print('imports OK on', __import__('sys').platform)"
+
+      # A test stuck for 2 minutes dumps every thread's stack into the log, so a
+      # hang shows where it is instead of the job sitting until it's cancelled.
+      - name: Run tests
+        run: pytest -q -o faulthandler_timeout=120
+
+  rust:
+    name: rust (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # macos-latest is arm64. The x64 macos-13 runners are retired: never add
+        # them back, a job on them sits queued forever.
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    defaults:
+      run:
+        working-directory: rust/tunetape-cli
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up stable Rust
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt,clippy
+          rustup default stable
+
+      - name: Format
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Release build
+        run: cargo build --locked --release

@@ -1,0 +1,51 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tunetape"
+version = "1.0.0"
+description = "Terminal audio player for YouTube, Spotify, and KHInsider"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.9"
+authors = [{ name = "oauramos" }]
+keywords = ["terminal", "audio", "player", "youtube", "spotify", "khinsider", "mpv", "yt-dlp", "tui", "cli", "music"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX",
+    "Operating System :: Microsoft :: Windows",
+    "Environment :: Console",
+    "Topic :: Multimedia :: Sound/Audio :: Players",
+]
+dependencies = [
+    "textual>=8.2,<9",
+    "rich>=14.2,<15",  # comes with textual; widgets.py measures with rich.cells
+    # KHInsider's Cloudflare turns away Python's own TLS; curl_cffi looks like a
+    # browser. Without it khinsider.py falls back to the system curl.
+    "curl_cffi>=0.7",
+    "pywin32>=306; sys_platform == 'win32'",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=7.0", "jsonschema>=4.18"]  # jsonschema: the protocol conformance suite
+
+[project.urls]
+Homepage = "https://github.com/oauramos/tunetape"
+Repository = "https://github.com/oauramos/tunetape"
+Issues = "https://github.com/oauramos/tunetape/issues"
+
+[tool.setuptools.packages.find]
+include = ["tunetape*"]
+
+[project.scripts]
+tunetape = "tunetape.__main__:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

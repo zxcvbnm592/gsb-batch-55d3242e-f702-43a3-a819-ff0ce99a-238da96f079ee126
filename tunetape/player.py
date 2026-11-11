@@ -1,0 +1,667 @@
+import atexit
+import glob
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+
+from tunetape import debug
+from tunetape.ipc import create_ipc
+from tunetape.models import Album, Track
+
+
+# Cache resolved executable paths so we probe the filesystem at most once each.
+_resolved_exe = {}
+
+
+def _windows_exe_candidates(name):
+    """Well-known install dirs winget/scoop use but may not add to PATH.
+
+    winget's ``shinchiro.mpv`` extracts to ``C:\\Program Files\\MPV Player``
+    without touching PATH, so ``shutil.which`` reports mpv missing even when it
+    is installed. Return absolute paths to probe, most-specific first.
+    """
+    exe = f"{name}.exe"
+    home = os.path.expanduser("~")
+    localappdata = os.environ.get("LOCALAPPDATA", "")
+    candidates = [
+        # scoop normally keeps its shim dir on PATH; probe it anyway as a fallback.
+        os.path.join(home, "scoop", "shims", exe),
+        os.path.join(home, "scoop", "apps", name, "current", exe),
+    ]
+    if name == "mpv":
+        candidates += [
+            r"C:\Program Files\MPV Player\mpv.exe",  # winget: shinchiro.mpv
+            r"C:\Program Files\mpv\mpv.exe",
+        ]
+    if localappdata:
+        if name == "mpv":
+            candidates.append(os.path.join(localappdata, "Programs", "mpv", "mpv.exe"))
+        # winget extracts each package under a versioned subfolder — glob across
+        # them and probe the most recently modified first, so a fresh upgrade
+        # wins over a leftover older version left behind in a sibling folder.
+        matches = glob.glob(
+            os.path.join(localappdata, "Microsoft", "WinGet", "Packages",
+                         f"*{name}*", "**", exe),
+            recursive=True,
+        )
+
+        def _mtime(path):
+            try:
+                return os.path.getmtime(path)
+            except OSError:
+                return 0.0
+
+        matches.sort(key=_mtime, reverse=True)
+        candidates += matches
+    return candidates
+
+
+def find_executable(name):
+    """Locate a CLI tool, honoring PATH first, then known Windows install dirs.
+
+    Returns an absolute path suitable as ``argv[0]``, or None if the tool can't
+    be found anywhere.
+    """
+    if name in _resolved_exe:
+        return _resolved_exe[name]
+
+    found = shutil.which(name)
+    if found is None and sys.platform == "win32":
+        for path in _windows_exe_candidates(name):
+            if os.path.isfile(path):
+                found = path
+                break
+    # Cache only successful resolutions: a tool the user installs mid-session
+    # should be re-probed and picked up rather than staying "missing" for the
+    # life of the process.
+    if found is not None:
+        _resolved_exe[name] = found
+    return found
+
+
+# A command line that stands in for the real tool (docs/architecture.md, "Test
+# seams"): the test suite points TUNETAPE_MPV at a fake mpv that needs no audio
+# device, and TUNETAPE_YTDLP at a fake yt-dlp that needs no network.
+_TOOL_OVERRIDES = {"mpv": "TUNETAPE_MPV", "yt-dlp": "TUNETAPE_YTDLP"}
+
+
+def _split_command(text: str) -> list:
+    if sys.platform != "win32":
+        return shlex.split(text)
+    # Non-POSIX mode keeps the quotes around "C:\Program Files\…" tokens, which
+    # CreateProcess would then look for literally.
+    return [tok[1:-1] if len(tok) > 1 and tok[0] == tok[-1] == '"' else tok
+            for tok in shlex.split(text, posix=False)]
+
+
+def _override(name: str):
+    env = _TOOL_OVERRIDES.get(name)
+    text = os.environ.get(env, "").strip() if env else ""
+    return (_split_command(text) or None) if text else None
+
+
+def tool_command(name: str):
+    """The argv prefix that runs ``name`` ("mpv" or "yt-dlp"), or None if missing.
+
+    ``$TUNETAPE_MPV`` / ``$TUNETAPE_YTDLP`` replace the executable lookup with a
+    whole command line. An override whose program doesn't exist counts as
+    missing (it never falls back to the real tool), so a test can simulate an
+    uninstalled yt-dlp by pointing the override at nothing.
+    """
+    argv = _override(name)
+    if argv is not None:
+        exe = argv[0]
+        return argv if (shutil.which(exe) or os.path.isfile(exe)) else None
+    exe = find_executable(name)
+    return [exe] if exe else None
+
+
+def _tool_argv(name: str) -> list:
+    """The command to launch: the override as given (the OS then reports a bad
+    one), else the located tool, else the bare name."""
+    return _override(name) or tool_command(name) or [name]
+
+
+def _install_hint(pkg: str) -> str:
+    """Platform-appropriate one-liner for installing a missing dependency."""
+    if sys.platform == "win32":
+        return f"Install it with: winget install {pkg}  (or: scoop install {pkg})"
+    if sys.platform == "darwin":
+        return f"Install it with: brew install {pkg}"
+    return f"Install it with your package manager, e.g. sudo apt install {pkg}"
+
+
+def check_dependencies(require_ytdlp: bool = True):
+    """Verify mpv (always) and yt-dlp (when required) exist in PATH."""
+    if not tool_command("mpv"):
+        raise RuntimeError(f"mpv is not installed. {_install_hint('mpv')}")
+    if require_ytdlp and not tool_command("yt-dlp"):
+        raise RuntimeError(f"yt-dlp is not installed. {_install_hint('yt-dlp')}")
+
+
+# [#9] Broadened regex: supports youtube.com, youtu.be, music/m subdomains, /live/, /embed/, /shorts/
+_YOUTUBE_RE = re.compile(
+    r"^(https?://)?(www\.|music\.|m\.)?"
+    r"(youtube\.com/(watch\?.*v=|shorts/|live/|embed/)|youtu\.be/)"
+    r"[\w\-]+"
+)
+
+
+def is_youtube_url(url: str) -> bool:
+    """True for a single YouTube video URL (not a playlist — see is_youtube_playlist_url)."""
+    return bool(_YOUTUBE_RE.match(url.strip()))
+
+
+# YouTube's SABR rollout caps the stream URLs handed out by yt-dlp's default
+# client (android_vr): they carry `rqh=1` and only answer small, bounded ranged
+# requests. ffmpeg — and so mpv — always opens a stream with an open-ended
+# `Range: bytes=0-`, which those URLs reject with HTTP 403. mpv's output was
+# discarded at the time, so the only symptom was playback frozen at 0:00.
+#
+# In Sep 2026 web_embedded URLs started failing too: most of them 403 on every
+# request, ranged or not. The visionos client (yt-dlp's own default since
+# 2026.08) returns plain, uncapped URLs that mpv streams directly, so it goes
+# first. web_embedded stays as the fallback for older yt-dlp builds that don't
+# know visionos yet. tv_embedded is gone from yt-dlp and android_vr no longer
+# returns audio formats, so both were dropped.
+# See https://github.com/yt-dlp/yt-dlp/issues/12482
+_DEFAULT_YTDLP_CLIENTS = "visionos,web_embedded"
+
+# mpv echoes the whole stream URL in its load errors; keep log lines readable.
+_MPV_LOG_LINE_MAX = 200
+
+# An audio filter that only measures: libavfilter's astats, reset every frame,
+# publishes per-channel peak and RMS levels (dBFS) that the player's level
+# meter reads back through mpv's af-metadata property.
+_METER_LABEL = "meter"
+_METER_FILTER = f"@{_METER_LABEL}:lavfi=[astats=metadata=1:reset=1]"
+
+
+def _ytdlp_client_args() -> list:
+    """Extractor args pinning which YouTube client yt-dlp resolves streams with.
+
+    $TUNETAPE_YTDLP_CLIENT overrides the default list, so a future YouTube
+    change can be worked around in place instead of waiting on a release.
+    """
+    clients = os.environ.get("TUNETAPE_YTDLP_CLIENT", "").strip() or _DEFAULT_YTDLP_CLIENTS
+    return ["--extractor-args", f"youtube:player_client={clients}"]
+
+
+def get_stream_info(url: str) -> dict:
+    """Extract audio stream URL and title from a YouTube URL."""
+    url = url.strip()
+    if not _YOUTUBE_RE.match(url):
+        raise ValueError("Invalid URL. Please paste a valid youtube.com or youtu.be link.")
+    return resolve_with_ytdlp(url)
+
+
+def resolve_with_ytdlp(arg: str) -> dict:
+    """Resolve a yt-dlp input to a playable audio stream URL + title.
+
+    ``arg`` is anything yt-dlp accepts as input: a YouTube watch URL or a
+    ``ytsearch1:<query>`` search (used to find the YouTube audio for a Spotify
+    track). Shared by the YouTube, YouTube-playlist, and Spotify resolvers so
+    the network/error handling lives in one place.
+    """
+    try:
+        result = subprocess.run(
+            [*_tool_argv("yt-dlp"),
+             "-f", "bestaudio", *_ytdlp_client_args(),
+             "--get-url", "--get-title", arg],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except subprocess.TimeoutExpired:
+        raise ConnectionError("Network error. Check your internet connection and try again.")
+    except OSError:
+        raise RuntimeError(f"yt-dlp is not installed. {_install_hint('yt-dlp')}")
+
+    if result.returncode != 0:
+        stderr = result.stderr.strip()
+        if "urlopen error" in stderr or "getaddrinfo" in stderr or "timed out" in stderr:
+            raise ConnectionError("Network error. Check your internet connection and try again.")
+        raise RuntimeError(
+            f"Could not load video. It may be private, unavailable, or region-blocked.\n\nDetails: {stderr}"
+        )
+
+    # `--get-title --get-url` prints the title first, then the URL. Take the
+    # title as the first line and the stream URL as the LAST http line — robust
+    # to a title that itself starts with "http" and to blank lines.
+    lines = [ln.strip() for ln in result.stdout.strip().split("\n") if ln.strip()]
+    if not lines:
+        raise RuntimeError("Could not extract stream information from yt-dlp output.")
+    stream_url = next((ln for ln in reversed(lines) if ln.startswith("http")), None)
+    if stream_url is None:
+        raise RuntimeError("Could not extract stream information from yt-dlp output.")
+    title = lines[0] if lines[0] != stream_url else "Unknown title"
+
+    return {"title": title, "stream_url": stream_url}
+
+
+# Matches a YouTube playlist URL — either the dedicated playlist page or a
+# watch URL carrying a `list=` param. Kept separate from _YOUTUBE_RE because the
+# bare `playlist?list=…` form (no v=) is not a single-video URL.
+_YT_PLAYLIST_RE = re.compile(
+    r"^(https?://)?(www\.|music\.|m\.)?youtube\.com/"
+    r"(playlist|watch)\?(\S*&)?list=[\w\-]+"
+)
+
+
+def is_youtube_playlist_url(url: str) -> bool:
+    return bool(_YT_PLAYLIST_RE.match(url.strip()))
+
+
+def _parse_flat_playlist(stdout: str) -> list:
+    """Parse `yt-dlp --flat-playlist --print "%(id)s|%(title)s"` output to Tracks.
+
+    Split on the FIRST `|` only, so a `|` inside a video title is preserved.
+    """
+    tracks = []
+    for line in stdout.strip().split("\n"):
+        line = line.strip()
+        if not line or "|" not in line:
+            continue
+        vid, title = line.split("|", 1)
+        vid = vid.strip()
+        if not vid:
+            continue
+        tracks.append(Track(
+            name=title.strip() or vid,
+            resolve_hint=f"https://www.youtube.com/watch?v={vid}",
+        ))
+    return tracks
+
+
+def fetch_youtube_playlist(url: str) -> Album:
+    """Enumerate a YouTube playlist (no download) and return an Album of Tracks."""
+    url = url.strip()
+    if not is_youtube_playlist_url(url):
+        raise ValueError("Invalid YouTube playlist URL.")
+
+    try:
+        result = subprocess.run(
+            [*_tool_argv("yt-dlp"), "--flat-playlist", "--no-warnings",
+             "--print", "%(id)s|%(title)s", url],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    except subprocess.TimeoutExpired:
+        raise ConnectionError("Network error. Check your internet connection and try again.")
+    except OSError:
+        raise RuntimeError(f"yt-dlp is not installed. {_install_hint('yt-dlp')}")
+
+    if result.returncode != 0:
+        stderr = result.stderr.strip()
+        if "urlopen error" in stderr or "getaddrinfo" in stderr or "timed out" in stderr:
+            raise ConnectionError("Network error. Check your internet connection and try again.")
+        raise RuntimeError(
+            f"Could not load playlist. It may be private or unavailable.\n\nDetails: {stderr}"
+        )
+
+    tracks = _parse_flat_playlist(result.stdout)
+    if not tracks:
+        raise ValueError(
+            "No videos found in the playlist. Double-check the URL.\n\n"
+            f"URL: {url}"
+        )
+    return Album(title="YouTube Playlist", tracks=tracks)
+
+
+class MPVController:
+    """Controls an mpv instance via IPC socket."""
+
+    def __init__(self, stream_url: str, normalize: bool = False, volume: float = None):
+        # [#5] IPC endpoint (Unix socket in a private temp dir, or a named pipe on
+        # Windows) — platform detail lives in tunetape.ipc.
+        self._ipc = create_ipc()
+        # mpv's output goes to a file rather than /dev/null: when a stream fails
+        # to load (a 403 on the media URL, say) mpv reports it there and nowhere
+        # else, and without it the UI can only show a player stuck at 0:00.
+        # Its own private dir, since the Windows transport has no temp dir to
+        # borrow and the Unix one cleans its dir up on its own schedule.
+        self._log_dir = tempfile.mkdtemp(prefix="tunetape_log_")
+        self._log_path = os.path.join(self._log_dir, "mpv.log")
+        self._log_file = None
+        # [#2] Use RLock to prevent deadlock when signal handler calls quit() while lock is held
+        self._lock = threading.RLock()
+        self._proc = None
+        self._closed = False  # [#16] Idempotent quit guard
+        self._buf = b""  # [#3] Persistent read buffer for IPC
+        self._req_id = 0  # Monotonic IPC request id for response matching
+        # Seed the cached reading with the launch volume so the meter shows the
+        # restored level immediately, before the first IPC poll lands.
+        self._last_volume = 100.0 if volume is None else float(volume)
+        self._last_muted = False
+
+        if not self._spawn_and_connect(stream_url, normalize, volume):
+            # The audio filters may be unavailable on a minimal mpv build; retry
+            # once without them before giving up so playback isn't blocked.
+            if not self._spawn_and_connect(stream_url, False, volume, meter=False):
+                self._ipc.cleanup()
+                self._cleanup_log()
+                raise RuntimeError("Could not connect to the player. Try again.")
+
+    def _spawn_and_connect(self, stream_url: str, normalize: bool, volume: float = None,
+                           meter: bool = True) -> bool:
+        """Launch mpv and connect to its IPC socket. Returns True on success.
+
+        On failure, reaps the spawned process so a retry can start cleanly.
+        """
+        # Start from a clean endpoint (a prior failed attempt may have left one).
+        self._ipc.reset()
+
+        args = [
+            *_tool_argv("mpv"),
+            "--no-video",
+            # --no-terminal would silence mpv completely, including the load
+            # errors we want captured. --no-input-terminal keeps it from
+            # touching stdin (the TUI owns the keyboard) while --msg-level
+            # limits output to real errors, which are redirected to a file
+            # below and never reach the user's terminal.
+            "--no-input-terminal",
+            "--msg-level=all=error",
+            f"--input-ipc-server={self._ipc.server_address}",
+        ]
+        filters = []
+        if normalize:
+            # Even out loudness across sources. Uses mpv's built-in libavfilter
+            # (no separate ffmpeg binary needed); dynaudnorm is single-pass and
+            # real-time friendly, which suits streaming.
+            filters.append("dynaudnorm")
+        if meter:
+            # Last in the chain, so it measures what you hear (before volume).
+            filters.append(_METER_FILTER)
+        if filters:
+            args.append("--af=" + ",".join(filters))
+        if volume is not None:
+            # Start at the user's last-set level instead of mpv's default 100%.
+            args.append(f"--volume={int(round(float(volume)))}")
+        # [#11] Use -- separator so stream_url can't be interpreted as mpv flag
+        args += ["--", stream_url]
+
+        # Truncate per attempt so a retry's log can't be read as the first try's,
+        # closing the previous attempt's handle instead of leaking it.
+        if self._log_file is not None:
+            try:
+                self._log_file.close()
+            except OSError:
+                pass
+        self._log_file = open(self._log_path, "w+b")
+        # mpv writes its messages to stdout, not stderr; fold both into the file.
+        self._proc = subprocess.Popen(
+            args,
+            stdout=self._log_file,
+            stderr=subprocess.STDOUT,
+        )
+        # Reap this child even if SIGINT/exit fires before the caller stores us
+        # (the socket-wait below can block for up to 5s). quit() is idempotent
+        # and unregisters itself, so this never accumulates or double-reaps.
+        atexit.register(self.quit)
+
+        # Wait (up to 5s) for mpv to create its IPC endpoint, then connect. An
+        # mpv that has already exited never will, so stop waiting at once.
+        if self._ipc.connect(5.0, alive=lambda: self._proc.poll() is None):
+            return True
+
+        # [#10] Reap zombie on this attempt's failure
+        self._proc.terminate()
+        try:
+            self._proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            self._proc.kill()
+            self._proc.wait()
+        # Log only once mpv has exited, so its complaint is fully written out.
+        self._log_mpv_output("mpv did not open its IPC socket")
+        atexit.unregister(self.quit)
+        return False
+
+    def _log_mpv_output(self, prefix: str) -> None:
+        """Copy whatever mpv reported into the in-session debug log.
+
+        Best-effort: a missing or unreadable log must never break teardown.
+        """
+        try:
+            with open(self._log_path, "r", encoding="utf-8", errors="replace") as f:
+                text = f.read().strip()
+        except OSError:
+            return
+        if not text:
+            return
+        # Keep the tail — the load error comes last. Each line is truncated
+        # because mpv echoes the full stream URL, which is ~1.5 KB of query
+        # string and would swamp the Debug screen.
+        for line in [ln.strip() for ln in text.splitlines() if ln.strip()][-10:]:
+            if len(line) > _MPV_LOG_LINE_MAX:
+                line = line[:_MPV_LOG_LINE_MAX] + "…"
+            debug.log(f"{prefix}: {line}", "ERROR")
+
+    def _cleanup_log(self):
+        """Close and remove the mpv log file and its private directory."""
+        try:
+            if self._log_file is not None:
+                self._log_file.close()
+                self._log_file = None
+        except OSError:
+            pass
+        try:
+            if os.path.exists(self._log_path):
+                os.unlink(self._log_path)
+        except OSError:
+            pass
+        try:
+            if os.path.exists(self._log_dir):
+                os.rmdir(self._log_dir)
+        except OSError:
+            pass
+
+    def _send(self, command: list) -> dict:
+        with self._lock:
+            if self._closed:
+                return {"error": "closed"}
+            try:
+                # [#3] Monotonic request_id so we return the reply to THIS command,
+                # never an async event or a late reply to an earlier command.
+                self._req_id += 1
+                request_id = self._req_id
+                msg = json.dumps({"command": command, "request_id": request_id}) + "\n"
+                self._ipc.send(msg.encode())
+
+                # [#4] Overall deadline for response (5s)
+                send_deadline = time.monotonic() + 5.0
+                while time.monotonic() < send_deadline:
+                    # Process lines from buffer
+                    while b"\n" in self._buf:
+                        line, self._buf = self._buf.split(b"\n", 1)
+                        try:
+                            parsed = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        # Only the reply echoing our request_id matches; skip
+                        # async events and stale replies to earlier commands.
+                        if isinstance(parsed, dict) and parsed.get("request_id") == request_id:
+                            return parsed
+
+                    # [#17] Cap buffer size
+                    if len(self._buf) > 65536:
+                        self._buf = b""
+                        return {"error": "response too large"}
+
+                    chunk = self._ipc.recv(4096)
+                    if not chunk:
+                        return {"error": "connection closed"}
+                    self._buf += chunk
+
+                return {"error": "timeout"}
+            except Exception:
+                return {"error": "send failed"}
+
+    def toggle_pause(self):
+        self._send(["cycle", "pause"])
+
+    def set_pause(self, paused: bool):
+        self._send(["set_property", "pause", bool(paused)])
+
+    def seek(self, seconds: float, relative: bool = True):
+        self._send(["seek", str(seconds), "relative" if relative else "absolute"])
+
+    def set_volume_relative(self, delta: float):
+        self._send(["add", "volume", str(delta)])
+
+    def set_volume(self, value: float):
+        resp = self._send(["set_property", "volume", float(value)])
+        if resp.get("error") == "success":
+            self._last_volume = float(value)
+
+    def toggle_mute(self):
+        self._send(["cycle", "mute"])
+
+    def set_mute(self, muted: bool):
+        resp = self._send(["set_property", "mute", bool(muted)])
+        if resp.get("error") == "success":
+            self._last_muted = bool(muted)
+
+    def exit_code(self):
+        """mpv's exit status once it has exited, else None."""
+        return None if self._proc is None else self._proc.poll()
+
+    def get_volume(self) -> float:
+        # mpv replies carry error="success" on success; our own failure dicts
+        # use other error values. Update the cache only on a real mpv success,
+        # otherwise hold the last good reading (avoids a 100%/unmuted flicker).
+        resp = self._send(["get_property", "volume"])
+        if resp.get("error") == "success":
+            try:
+                self._last_volume = float(resp.get("data"))
+            except (TypeError, ValueError):
+                pass
+        return self._last_volume
+
+    def is_muted(self) -> bool:
+        resp = self._send(["get_property", "mute"])
+        if resp.get("error") == "success":
+            self._last_muted = bool(resp.get("data", False))
+        return self._last_muted
+
+    def get_position(self) -> float:
+        resp = self._send(["get_property", "playback-time"])
+        try:
+            return float(resp.get("data", 0.0))
+        except (TypeError, ValueError):
+            return 0.0
+
+    def get_duration(self) -> float:
+        resp = self._send(["get_property", "duration"])
+        try:
+            return float(resp.get("data", 0.0))
+        except (TypeError, ValueError):
+            return 0.0
+
+    def is_paused(self) -> bool:
+        resp = self._send(["get_property", "pause"])
+        return bool(resp.get("data", False))
+
+    def _get(self, name: str):
+        """A property's value, or None when mpv doesn't have it (yet)."""
+        resp = self._send(["get_property", name])
+        return resp.get("data") if resp.get("error") == "success" else None
+
+    def get_levels(self):
+        """Per-channel (rms, peak) levels in dBFS from the meter filter, or None.
+
+        Read every frame by the filter, so this is the sound right now; the
+        values are stale while paused, which the caller knows about.
+        """
+        meta = self._get(f"af-metadata/{_METER_LABEL}")
+        if not isinstance(meta, dict):
+            return None
+        levels = []
+        for channel in range(1, 9):
+            rms = meta.get(f"lavfi.astats.{channel}.RMS_level")
+            peak = meta.get(f"lavfi.astats.{channel}.Peak_level")
+            if rms is None or peak is None:
+                break
+            try:
+                levels.append((float(rms), float(peak)))  # "-inf" for silence
+            except ValueError:
+                break
+        return levels or None
+
+    def get_stats(self) -> dict:
+        """What is playing and how it is arriving, for the player's stream panel.
+
+        Every value may be None (not known yet, or not applicable).
+        """
+        params = self._get("audio-params") or {}
+        cache = self._get("demuxer-cache-state") or {}
+        filters = self._get("af") or []
+        return {
+            "codec": self._get("audio-codec-name"),
+            "bitrate": self._get("audio-bitrate"),            # bits/s
+            "samplerate": params.get("samplerate"),
+            "channels": params.get("hr-channels") or params.get("channels"),
+            "container": self._get("file-format"),
+            "ahead": self._get("demuxer-cache-duration"),     # seconds buffered
+            "cached": cache.get("total-bytes"),               # bytes held in cache
+            "speed": self._get("cache-speed"),                # bytes/s downloading
+            "normalized": any(f.get("name") == "dynaudnorm" for f in filters
+                              if isinstance(f, dict)),
+        }
+
+    def is_alive(self) -> bool:
+        return self._proc is not None and self._proc.poll() is None
+
+    def quit(self):
+        # [#16] Idempotent quit — safe to call multiple times / from signal handler
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+
+        asked = False
+        try:
+            if self._ipc.connected:
+                msg = json.dumps({"command": ["quit"]}) + "\n"
+                self._ipc.send(msg.encode())
+                asked = True
+        except Exception:
+            pass
+        try:
+            if self._proc is not None:
+                # mpv normally exits on the quit command at once; give it a
+                # moment to, then insist, then kill — teardown stays bounded.
+                if asked:
+                    try:
+                        self._proc.wait(timeout=0.5)
+                    except subprocess.TimeoutExpired:
+                        pass
+                if self._proc.poll() is None:
+                    self._proc.terminate()
+                    self._proc.wait(timeout=1.5)
+        except Exception:
+            try:
+                self._proc.kill()
+                self._proc.wait()
+            except Exception:
+                pass
+        try:
+            self._ipc.close()
+        except Exception:
+            pass
+        # Read the log before _cleanup_log() deletes it, so anything mpv
+        # complained about this session is visible on the Debug screen.
+        self._log_mpv_output("mpv")
+        self._ipc.cleanup()
+        self._cleanup_log()
+        try:
+            atexit.unregister(self.quit)
+        except Exception:
+            pass
