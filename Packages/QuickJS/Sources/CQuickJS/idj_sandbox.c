@@ -27,6 +27,13 @@ static int interrupt_cb(JSRuntime *rt, void *opaque) {
     return 0;
 }
 
+/// Arms the JS execution budget. timeout_sec <= 0 means "no deadline": leave b->deadline at 0 so the
+/// interrupt handler never fires (a deadline of now_s() + 0 would trip on the first interrupt poll).
+static void arm_deadline(IDJBox *b, double timeout_sec) {
+    b->interrupted = 0;
+    b->deadline = timeout_sec > 0 ? now_s() + timeout_sec : 0;
+}
+
 static char *dupstr(const char *s) {
     size_t n = strlen(s);
     char *r = malloc(n + 1);
@@ -214,8 +221,7 @@ static int run_bytecode(IDJBox *b, uint8_t *buf, size_t len, int module, JSValue
 int idj_load(IDJBox *b, const char *prelude, const char *src, const char *filename, double timeout_sec, char **err) {
     *err = NULL;
     JS_UpdateStackTop(b->rt);
-    b->interrupted = 0;
-    b->deadline = now_s() + timeout_sec;
+    arm_deadline(b, timeout_sec);
     size_t len = 0;
     uint8_t *bc = compile(b, prelude, "<prelude>", 0, &len, err);
     int rc = -1;
@@ -258,8 +264,7 @@ char *idj_call(IDJBox *b, const char *fn, const char *arg_json, double timeout_s
     JSContext *ctx = b->ctx;
     if (!JS_IsObject(b->plugin)) { *err = err_json("E_INTERNAL", "插件未加载"); return NULL; }
     JS_UpdateStackTop(b->rt);
-    b->interrupted = 0;
-    b->deadline = now_s() + timeout_sec;
+    arm_deadline(b, timeout_sec);
     char *out = NULL;
     JSValue f = JS_GetPropertyStr(ctx, b->plugin, fn);
     if (!JS_IsFunction(ctx, f)) {
@@ -287,8 +292,7 @@ char *idj_call(IDJBox *b, const char *fn, const char *arg_json, double timeout_s
 char *idj_eval_script(IDJBox *b, const char *src, double timeout_sec, char **err) {
     *err = NULL;
     JS_UpdateStackTop(b->rt);
-    b->interrupted = 0;
-    b->deadline = now_s() + timeout_sec;
+    arm_deadline(b, timeout_sec);
     size_t len = 0;
     char *out = NULL;
     uint8_t *bc = compile(b, src, "<test>", 0, &len, err);
