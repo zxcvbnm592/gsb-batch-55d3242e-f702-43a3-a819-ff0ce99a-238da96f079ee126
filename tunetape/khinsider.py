@@ -96,20 +96,33 @@ _CDN_AUDIO_RE = re.compile(
 
 
 class _TrackPageParser(HTMLParser):
-    """Parse a track page to find the direct CDN download link."""
+    """Parse a track page to find every direct CDN download link.
+
+    A track page can expose several mirrors/formats, so all candidate audio
+    links are collected in document order and de-duplicated (the first
+    occurrence wins). Query strings are part of the URL and mixed-case
+    extensions are recognized by ``_CDN_AUDIO_RE``. ``direct_url`` is kept as
+    a convenience for callers that only need the single preferred link.
+    """
 
     def __init__(self):
         super().__init__()
-        self.direct_url = None
+        self.candidates = []
+        self._seen_hrefs = set()
+
+    @property
+    def direct_url(self):
+        return self.candidates[0] if self.candidates else None
 
     def handle_starttag(self, tag, attrs):
-        if self.direct_url:
+        if tag != "a":
             return
-        if tag == "a":
-            href = dict(attrs).get("href", "")
-            # Match any external audio file URL (not a khinsider page link)
-            if _CDN_AUDIO_RE.match(href) and "khinsider.com" not in href:
-                self.direct_url = href
+        href = dict(attrs).get("href", "")
+        # Match any external audio file URL (not a khinsider page link)
+        if _CDN_AUDIO_RE.match(href) and "khinsider.com" not in href:
+            if href not in self._seen_hrefs:
+                self._seen_hrefs.add(href)
+                self.candidates.append(href)
 
 
 # KHInsider's pages sit behind Cloudflare, which (since October 2026) turns
@@ -240,7 +253,12 @@ def fetch_album(url: str) -> Album:
 
 
 def resolve_track_url(track: Track) -> str:
-    """Resolve direct MP3 URL for a track (1 HTTP request, cached)."""
+    """Resolve the direct audio URL for a track (1 HTTP request, cached).
+
+    Every candidate CDN link on the track page is collected; the first one is
+    preferred and cached on ``track.direct_url`` so a repeat resolution never
+    hits the network again.
+    """
     if track.direct_url:
         return track.direct_url
 
@@ -248,10 +266,11 @@ def resolve_track_url(track: Track) -> str:
     parser = _TrackPageParser()
     parser.feed(html)
 
-    if not parser.direct_url:
+    if not parser.candidates:
         raise RuntimeError(
-            f"Could not find a download link for '{track.name}'. "
-            "KHInsider's page format may have changed."
+            f"Could not find a download link for '{track.name}' on its track "
+            f"page ({track.resolve_hint}). KHInsider's page format may have "
+            "changed, or this track has no download available."
         )
 
     track.direct_url = parser.direct_url
